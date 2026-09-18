@@ -6,8 +6,9 @@ you want to pass BEFORE a scheduler hands the node to an expensive multi-GPU
 job, not the kind you discover you needed after the job has been silently
 degraded for six hours.
 
-Checks: GPU temperature, ECC errors, NVLink state, GPU memory, Fabric
-Manager, DCGM diagnostics, InfiniBand state, disk capacity, CPU load.
+Checks: GPU temperature, thermal throttle state, ECC errors, NVLink state,
+GPU memory, Fabric Manager, DCGM diagnostics, InfiniBand state, disk
+capacity, CPU load.
 
 Usage:
     python3 gpu_health_checker.py
@@ -53,9 +54,31 @@ class CheckResult:
 
 # Thresholds -- tune these per GPU generation / fleet SLA. What's "hot" for
 # an air-cooled A100 in a warm datacenter is not what's hot for a
-# liquid-cooled H100.
+# liquid-cooled H100. GPU_TEMP_WARN_C/FAIL_C are the generic fallback used
+# for any GPU not in GPU_TEMP_THRESHOLDS_C below.
 GPU_TEMP_WARN_C = 80
 GPU_TEMP_FAIL_C = 90
+
+# Per-model overrides, substring-matched against nvidia-smi's `name` field
+# (so board variants like SXM/PCIe/NVL and memory-size suffixes all match on
+# the family name). These are BEST-EFFORT numbers, not verified against real
+# hardware -- confirm against the actual datasheet for your SKU. Confidence
+# varies a lot by model, which is exactly why it's tracked per entry instead
+# of presented as one uniform table:
+#   - A100: 85C max operating temp is a widely-repeated datasheet figure
+#     across SXM4/PCIe variants. Moderate-good confidence.
+#   - H100: published max operating temps I've seen range ~83-90C across
+#     SXM5/PCIe/NVL variants and sources -- real spread, not one clean
+#     number. 88 is a deliberately conservative pick, not a citation.
+#   - B200: Blackwell is new enough that there's no number here I'd stand
+#     behind. `None` means "recognized model, no verified threshold yet" --
+#     it falls back to the generic default and says so in the check output,
+#     rather than silently guessing.
+GPU_TEMP_THRESHOLDS_C: dict[str, tuple[int, int] | None] = {
+    "A100": (75, 85),
+    "H100": (78, 88),
+    "B200": None,
+}
 GPU_MEM_USED_WARN_PCT = 90
 DISK_FREE_WARN_PCT = 15
 DISK_FREE_FAIL_PCT = 5
@@ -95,24 +118,68 @@ def query_nvidia_smi(fields: str, name: str) -> tuple[list[list[str]], CheckResu
     return rows, None
 
 
+def resolve_temp_thresholds(model: str) -> tuple[int, int, bool]:
+    """Return (warn_c, fail_c, is_model_specific) for a GPU model name.
+
+    Substring-matches `model` against GPU_TEMP_THRESHOLDS_C. Falls back to
+    the generic GPU_TEMP_WARN_C/FAIL_C both when the model isn't in the
+    table at all, and when it's in the table but mapped to None (a model
+    that's recognized but has no verified threshold yet) -- both cases
+    genuinely have no verified number, so both get the same honest fallback.
+    """
+    for key, thresholds in GPU_TEMP_THRESHOLDS_C.items():
+        if key in model and thresholds is not None:
+            return thresholds[0], thresholds[1], True
+    return GPU_TEMP_WARN_C, GPU_TEMP_FAIL_C, False
+
+
 # ---------------------------------------------------------------- checks --
 
 def check_gpu_temperature() -> CheckResult:
     name = "gpu_temperature"
-    rows, early = query_nvidia_smi("index,temperature.gpu", name)
+    rows, early = query_nvidia_smi("index,name,temperature.gpu", name)
     if early:
         return early
 
     worst = Status.PASS
     details = []
-    for idx, temp in rows:
+    for idx, model, temp in rows:
         temp_c = int(temp)
-        if temp_c >= GPU_TEMP_FAIL_C:
+        warn_c, fail_c, is_model_specific = resolve_temp_thresholds(model)
+        if temp_c >= fail_c:
             worst = Status.FAIL
-        elif temp_c >= GPU_TEMP_WARN_C and worst != Status.FAIL:
+        elif temp_c >= warn_c and worst != Status.FAIL:
             worst = Status.WARN
-        details.append(f"gpu{idx}={temp_c}C")
+        basis = f"fail>={fail_c}C" if is_model_specific else f"fail>={fail_c}C,default-unverified-for-model"
+        details.append(f"gpu{idx}={temp_c}C({model},{basis})")
     return CheckResult(name, worst, ", ".join(details))
+
+
+def check_thermal_throttle() -> CheckResult:
+    name = "thermal_throttle"
+    # These two fields are read directly from the driver, not inferred from
+    # a temperature number -- they answer "is this GPU's clock currently
+    # being held back for heat" as reported by the hardware itself, the
+    # same signal nvidia-smi -q shows under "Clocks Throttle Reasons" as
+    # "HW Thermal Slowdown" / "SW Thermal Slowdown". Independent of, and a
+    # stronger signal than, the threshold-based gpu_temp check above.
+    rows, early = query_nvidia_smi(
+        "index,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown", name
+    )
+    if early:
+        return early
+
+    throttled = []
+    details = []
+    for idx, hw_thermal, sw_thermal in rows:
+        reasons = [r for r, active in (("hw", hw_thermal), ("sw", sw_thermal)) if active == "Active"]
+        if reasons:
+            throttled.append(f"gpu{idx}({'+'.join(reasons)})")
+        details.append(f"gpu{idx}=hw:{hw_thermal},sw:{sw_thermal}")
+
+    if throttled:
+        return CheckResult(name, Status.FAIL, f"actively thermal-throttling: {', '.join(throttled)}")
+    return CheckResult(name, Status.PASS, ", ".join(details))
 
 
 def check_ecc_errors() -> CheckResult:
@@ -204,20 +271,69 @@ def check_fabric_manager() -> CheckResult:
     return CheckResult(name, Status.FAIL, f"nvidia-fabricmanager service is '{state}', expected 'active'")
 
 
+def parse_dcgm_diag_json(report: dict) -> list[tuple[str, str, str]]:
+    """Walk a `dcgmi diag -j` report and return (gpu_id, test_name, status) triples.
+
+    DCGM's diagnostic JSON schema has changed across releases, so this
+    accepts the shape rather than assuming a single rigid structure will
+    always match. Returns [] if nothing recognizable is found -- the caller
+    must treat that as "could not parse", not "everything passed".
+    """
+    diag = report.get("DCGM GPU Diagnostic") or report.get("DCGM Diagnostic") or report
+    categories = diag.get("test_categories") if isinstance(diag, dict) else None
+    if not isinstance(categories, list):
+        return []
+
+    triples = []
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        for test in category.get("tests", []):
+            if not isinstance(test, dict):
+                continue
+            test_name = test.get("name", "unknown_test")
+            results = test.get("results")
+            if isinstance(results, list) and results:
+                for r in results:
+                    if isinstance(r, dict) and "status" in r:
+                        triples.append((str(r.get("gpu_id", "?")), test_name, str(r["status"])))
+            elif "status" in test:
+                triples.append((str(test.get("gpu_id", "?")), test_name, str(test["status"])))
+    return triples
+
+
 def check_dcgm_diagnostics(run_level: str) -> CheckResult:
     name = "dcgm_diagnostics"
     if binary_missing("dcgmi"):
         return CheckResult(name, Status.SKIP, "dcgmi not found on PATH (DCGM not installed)")
 
     timeout = DCGM_DIAG_TIMEOUT_S.get(run_level, 300)
-    result = run_cmd(["dcgmi", "diag", "-r", run_level], timeout=timeout)
+    result = run_cmd(["dcgmi", "diag", "-r", run_level, "-j"], timeout=timeout)
     output = result.stdout
     if result.returncode != 0 and not output:
         return CheckResult(name, Status.FAIL, f"dcgmi diag failed to run: {result.stderr.strip()}")
 
     # dcgmi diag's process exit code does not reliably reflect whether any
-    # individual test failed -- you have to read the report. Look for
-    # "Fail"/"Warn" as whole words in the results table.
+    # individual test failed -- you have to read the report. Prefer -j's
+    # structured JSON so a failure can be attributed to a specific test and
+    # GPU; if a DCGM version emits a JSON shape this doesn't recognize (the
+    # schema has changed across releases), fall back to a coarse text scan
+    # of the same output instead of silently reporting PASS.
+    triples: list[tuple[str, str, str]] = []
+    try:
+        triples = parse_dcgm_diag_json(json.loads(output))
+    except (json.JSONDecodeError, AttributeError):
+        triples = []
+
+    if triples:
+        failing = [f"gpu{gpu}:{test}" for gpu, test, status in triples if status.lower() == "fail"]
+        warning = [f"gpu{gpu}:{test}" for gpu, test, status in triples if status.lower() == "warn"]
+        if failing:
+            return CheckResult(name, Status.FAIL, "; ".join(failing[:8]))
+        if warning:
+            return CheckResult(name, Status.WARN, "; ".join(warning[:8]))
+        return CheckResult(name, Status.PASS, f"dcgmi diag -r {run_level}: {len(triples)} tests passed")
+
     fail_lines = [l.strip() for l in output.splitlines() if re.search(r"\bFail\b", l)]
     if fail_lines:
         return CheckResult(name, Status.FAIL, "; ".join(fail_lines[:5]))
@@ -291,6 +407,7 @@ def check_cpu_load() -> CheckResult:
 
 CHECKS: dict[str, Callable[[], CheckResult]] = {
     "gpu_temp": check_gpu_temperature,
+    "throttle": check_thermal_throttle,
     "ecc": check_ecc_errors,
     "gpu_memory": check_gpu_memory,
     "nvlink": check_nvlink_state,
